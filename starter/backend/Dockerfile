@@ -10,7 +10,7 @@ RUN apt-get update && \
   gcc \
   libssl-dev \
   libffi-dev \
-  libpcre3-dev \
+  libpcre2-dev \
   && pip install --no-cache-dir pipenv \
   && rm -rf /var/lib/apt/lists/*
 
