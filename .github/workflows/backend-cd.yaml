@@ -2,16 +2,17 @@ name: Backend Continuous Deployment
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - "starter/backend/**"
       - ".github/workflows/backend-cd.yaml"
   workflow_dispatch:
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   EKS_CLUSTER_NAME: cluster
   ECR_REPOSITORY: backend
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   lint:
@@ -24,18 +25,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version-file: starter/backend/.nvmrc
-          cache: npm
-          cache-dependency-path: starter/backend/package-lock.json
+          python-version: "3.10"
+
+      - name: Install pipenv
+        run: pip install pipenv
 
       - name: Install dependencies
-        run: npm ci
+        run: pipenv install --dev
 
       - name: Run lint
-        run: npm run lint
+        run: pipenv run flake8 .
 
   test:
     name: Test
@@ -47,28 +49,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version-file: starter/backend/.nvmrc
-          cache: npm
-          cache-dependency-path: starter/backend/package-lock.json
+          python-version: "3.10"
+
+      - name: Install pipenv
+        run: pip install pipenv
 
       - name: Install dependencies
-        run: npm ci
+        run: pipenv install --dev
 
       - name: Run tests
-        run: CI=true npm test
+        run: pipenv run pytest -q
 
   build_and_push:
     name: Build and Push
     runs-on: ubuntu-latest
-    needs: [ lint, test ]
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-    defaults:
-      run:
-        working-directory: starter/backend
+    needs: [lint, test]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,29 +76,25 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image tag
-        id: meta
-        run: echo "image_tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Build Docker image
+      - name: Build, tag, and push image to ECR
+        working-directory: starter/backend
         run: |
-          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-          docker build -t ${REGISTRY}/${ECR_REPOSITORY}:${{ steps.meta.outputs.image_tag }} .
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-      - name: Push Docker image
-        run: |
-          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-          docker push ${REGISTRY}/${ECR_REPOSITORY}:${{ steps.meta.outputs.image_tag }}
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
 
   deploy:
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [ build_and_push ]
+    needs: [build_and_push]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -110,13 +104,17 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}"
+
+      - name: Compute IMAGE_URI
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "IMAGE_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}" >> $GITHUB_ENV
 
       - name: Deploy backend (update image)
         run: |
-          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-          kubectl set image deployment/backend backend=${REGISTRY}/${ECR_REPOSITORY}:${{ needs.build_and_push.outputs.image_tag }}
+          kubectl set image deployment/backend backend="${IMAGE_URI}"
           kubectl rollout status deployment/backend --timeout=180s
